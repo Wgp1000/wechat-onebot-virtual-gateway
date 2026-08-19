@@ -9,6 +9,43 @@ client database decryption, or an AI model at runtime.
 > Inbound private-text work is experimental and disabled by default. Group
 > inbound and native `@` mentions are not supported.
 
+## Testing and feedback
+
+This project has currently been tested only by manual verification and a local
+Shell-based OneBot V11 WebSocket client. It has **not** yet been integrated or
+compatibility-tested with third-party bot platforms because the project is
+maintained by a small team.
+
+Join the public test and feedback group:
+
+```text
+744528507
+```
+
+Please include the following when reporting an issue:
+
+- gateway version / commit;
+- Linux distribution and Docker version;
+- whether reverse or forward WebSocket was used;
+- the OneBot action or event shape involved;
+- sanitized gateway/panel logs; never post QR images, access tokens, WeChat
+  profile files, chat screenshots, or message history.
+
+### Current capability matrix
+
+| Capability | State | Notes |
+|---|---|---|
+| Official WeChat QR login in Docker | Verified | Uses the official Linux client. |
+| Management panel | Verified | QR/status, mappings, protocol config, sanitized logs. |
+| OneBot V11 reverse WebSocket | Verified | Tested with a local Shell WebSocket client. |
+| OneBot V11 forward WebSocket | Implemented | Configuration hot-reloads; third-party compatibility still needs testing. |
+| `get_friend_list` | Verified | Returns approved local mappings. |
+| `send_private_msg` | Verified | UI-submitted text only; no recipient read/delivery guarantee. |
+| Private text inbound | Experimental / disabled | Fail-closed while visual identity and copy verification are calibrated. |
+| Group inbound | Not supported | Not emitted as private events. |
+| Native group `@` mentions | Not supported | Not emulated as literal text. |
+| Media/file/sticker/reply fidelity | Not supported | Text-only scope. |
+
 ## Supported scope
 
 | Capability | Status |
@@ -138,4 +175,5 @@ python3 -m unittest discover -s panel/tests -v
 
 ## License
 
-MIT. The official WeChat client remains subject to Tencent's terms and license.
+Apache License 2.0. The official WeChat client remains subject to Tencent's
+terms and license.
