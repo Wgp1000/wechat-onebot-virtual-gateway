@@ -2,6 +2,11 @@
 from __future__ import annotations
 
 
+def has_copy_action(menu_text: str) -> bool:
+    tokens = {token.strip().lower() for token in menu_text.splitlines()}
+    return "copy" in tokens or "复制" in tokens
+
+
 def copy_menu_point(bounds: tuple[int, int, int, int], origin: tuple[int, int]) -> tuple[int, int] | None:
     left, top, width, height = bounds
     ox, oy = origin
