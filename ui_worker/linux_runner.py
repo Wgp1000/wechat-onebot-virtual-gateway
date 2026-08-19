@@ -5,12 +5,19 @@ import subprocess
 import time
 from pathlib import Path
 
+from ui_worker.copy_menu import copy_action_point_from_tsv
+
 
 class LinuxWeChatRunner:
-    def __init__(self, display: str = ":99", window=(129, 30, 1021, 740)) -> None:
+    def __init__(
+        self,
+        display: str = ":99",
+        window: tuple[int, int, int, int] = (129, 30, 1021, 740),
+        workdir: Path | None = None,
+    ) -> None:
         self.display = display
         self.x, self.y, self.width, self.height = window
-        self.workdir = Path("/tmp/wechat-adapter")
+        self.workdir = workdir or Path("/tmp/wechat-adapter")
         self.workdir.mkdir(parents=True, exist_ok=True)
 
     def _run(self, command: str) -> None:
@@ -21,7 +28,6 @@ class LinuxWeChatRunner:
         time.sleep(0.2)
 
     def type_search(self, text: str) -> None:
-        # Clipboard avoids keyboard-layout and non-ASCII key-event problems.
         encoded = text.replace("'", "'\\''")
         self._run(f"printf '%s' '{encoded}' | xclip -selection clipboard; DISPLAY={self.display} xdotool key ctrl+a ctrl+v")
         time.sleep(0.8)
@@ -44,3 +50,27 @@ class LinuxWeChatRunner:
         self._run(f"printf '%s' '{encoded}' | xclip -selection clipboard; DISPLAY={self.display} xdotool mousemove {self.x + 301} {self.y + 645} click 1; xdotool key ctrl+v")
         time.sleep(0.3)
         self._run(f"DISPLAY={self.display} xdotool mousemove {self.x + 951} {self.y + 706} click 1")
+
+    def copy_bubble_text(self, point: tuple[int, int], menu_origin: tuple[int, int]) -> str | None:
+        x, y = point
+        menu_png = self.workdir / "copy-menu.png"
+        menu_tsv = self.workdir / "copy-menu.tsv"
+        self._run(f"DISPLAY={self.display} xdotool mousemove {x} {y} click 3")
+        time.sleep(0.4)
+        try:
+            self._run(f"DISPLAY={self.display} xwd -root -silent > {self.workdir / 'copy-menu.xwd'}")
+            subprocess.run([
+                "convert", str(self.workdir / "copy-menu.xwd"), "-crop", "360x320+500+480",
+                "-resize", "300%", "-colorspace", "Gray", "-contrast-stretch", "1%x1%", "-threshold", "70%", str(menu_png),
+            ], check=True)
+            result = subprocess.run(["tesseract", str(menu_png), "stdout", "-l", "chi_sim+eng", "--psm", "11", "tsv"], capture_output=True, text=True, check=True)
+            menu_tsv.write_text(result.stdout)
+            copy_point = copy_action_point_from_tsv(result.stdout, menu_origin, 3)
+            if copy_point is None:
+                return None
+            self._run(f"DISPLAY={self.display} xdotool mousemove {copy_point[0]} {copy_point[1]} click 1")
+            time.sleep(0.3)
+            copied = subprocess.run(["sh", "-c", f"DISPLAY={self.display} xclip -o -selection clipboard"], capture_output=True, text=True, check=True)
+            return copied.stdout
+        finally:
+            self._run(f"DISPLAY={self.display} xdotool key Escape")
