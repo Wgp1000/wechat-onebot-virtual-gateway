@@ -1,0 +1,41 @@
+# Runtime state and credentials
+runtime/*
+!runtime/installers/
+!runtime/installers/README.md
+!runtime/.gitkeep
+*.env
+!.env.example
+
+# Never publish WeChat login/session state
+**/.xwechat/
+**/wechat-profile/
+**/contacts.json
+**/*.sqlite3
+**/*.sqlite
+**/*.db
+**/*.mmap
+**/*.xlog
+**/*.dat
+**/*.key
+**/*.cache
+
+# Local evidence can include QR/session/chat contents
+evidence/
+research/
+
+# Official client installer: users obtain it themselves
+runtime/installers/*.deb
+
+# Python generated files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+
+# Local build and editor files
+*.log
+*.xwd
+*.png
+.DS_Store
+.vscode/
+.idea/

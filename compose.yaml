@@ -1,0 +1,55 @@
+services:
+  virtual-desktop:
+    build:
+      context: .
+      dockerfile: ./images/virtual-desktop/Dockerfile
+    image: local/wechat-virtual-desktop:milestone-0
+    container_name: wechat-virtual-desktop
+    environment:
+      DISPLAY: :99
+      VNC_PORT: 5900
+      NOVNC_PORT: 6080
+    ports:
+      - "127.0.0.1:6080:6080"
+      - "127.0.0.1:8088:8088"
+    volumes:
+      - ./runtime/wechat-profile:/root/.xwechat
+    networks:
+      - default
+      - internal
+    restart: "no"
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /tmp/.X11-unix/X99 && wget -qO- http://127.0.0.1:6080/vnc.html >/dev/null"]
+      interval: 10s
+      timeout: 4s
+      retries: 6
+      start_period: 15s
+
+  gateway:
+    build:
+      context: .
+      dockerfile: ./gateway/Dockerfile
+    image: local/wechat-onebot-gateway:milestone-0
+    container_name: wechat-onebot-gateway
+    environment:
+      GATEWAY_DATABASE: /data/gateway.sqlite3
+      GATEWAY_HOST: 0.0.0.0
+      GATEWAY_PORT: 16700
+      UI_WORKER_URL: http://virtual-desktop:9126
+      CONTACTS_PATH: /data/contacts.json
+    ports:
+      - "127.0.0.1:16700:16700"
+    volumes:
+      - ./runtime/gateway:/data
+      - ./runtime/wechat-profile/adapter/contacts.json:/data/contacts.json:ro
+    networks:
+      - default
+      - internal
+    restart: "no"
+
+networks:
+  default:
+    external: true
+    name: wechat-virtual-gateway_default
+  internal:
+    internal: true

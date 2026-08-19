@@ -1,0 +1,168 @@
+"""Local, token-gated panel for the virtual WeChat login state."""
+from __future__ import annotations
+
+import hmac
+import html
+import json
+import os
+import subprocess
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+from panel.inbound_status import private_inbound_status
+from panel.logs import sanitize_log_line
+from panel.config_api import apply_contact_mapping, apply_protocol_config
+from panel.qr_state import login_state_from_x11
+from ui_worker.contact_map import ContactMapStore
+
+PORT = int(os.environ.get("PANEL_PORT", "9120"))
+TOKEN = os.environ.get("PANEL_TOKEN", "")
+RUNTIME = Path(os.environ.get("PANEL_RUNTIME", "runtime/panel"))
+GATEWAY_RUNTIME = Path(os.environ.get("GATEWAY_RUNTIME", "runtime/gateway"))
+
+
+def authorized(token: str | None) -> bool:
+    configured = os.environ.get("PANEL_TOKEN", "")
+    return bool(configured) and isinstance(token, str) and hmac.compare_digest(configured, token)
+
+
+def token_from_path(path: str) -> str | None:
+    parts = [part for part in path.split("/") if part]
+    return parts[0] if parts else None
+
+
+def qr_image_path() -> str:
+    return "qr.png"
+
+
+def management_config() -> dict[str, object]:
+    protocol_path = GATEWAY_RUNTIME / "protocol.json"
+    contacts_path = Path("runtime/wechat-profile/adapter/contacts.json")
+    protocol = json.loads(protocol_path.read_text()) if protocol_path.exists() else {}
+    contacts = ContactMapStore(contacts_path)._load()
+    return {"protocol": protocol, "contacts": contacts}
+
+
+def runtime_logs() -> list[str]:
+    try:
+        output = subprocess.run(["docker", "logs", "--tail", "80", "wechat-onebot-gateway"], capture_output=True, text=True, timeout=8).stdout
+    except (OSError, subprocess.SubprocessError):
+        output = "Gateway log unavailable"
+    allowed = ("OneBot", "Forward WebSocket", "Gateway background", "UI worker poll")
+    return [sanitize_log_line(line) for line in output.splitlines() if any(marker in line for marker in allowed)][-40:]
+
+
+def current_state() -> tuple[dict[str, object], Path | None]:
+    raw = subprocess.check_output(
+        ["docker", "exec", "wechat-virtual-desktop", "cat", "/tmp/runtime-wechat/x11-status.json"],
+        text=True,
+    )
+    x11 = json.loads(raw)
+    state = login_state_from_x11(x11)
+    data: dict[str, object] = {"mode": state.mode, "qr_available": False}
+    if state.window_box is None:
+        return data, None
+    x, y, width, height = state.window_box
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    xwd = RUNTIME / "login-window.xwd"
+    png = RUNTIME / "login-window.png"
+    subprocess.run(
+        ["docker", "exec", "wechat-virtual-desktop", "sh", "-c", "DISPLAY=:99 xwd -root -silent > /tmp/panel-screen.xwd"],
+        check=True,
+    )
+    subprocess.run(["docker", "cp", "wechat-virtual-desktop:/tmp/panel-screen.xwd", str(xwd)], check=True)
+    subprocess.run(["convert", str(xwd), "-crop", f"{width}x{height}+{x}+{y}", str(png)], check=True)
+    data["qr_available"] = True
+    return data, png
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        token = token_from_path(parsed.path) or parse_qs(parsed.query).get("token", [None])[0]
+        relative_path = "/" + "/".join([part for part in parsed.path.split("/") if part][1:])
+        if not authorized(token):
+            self.send_error(403, "valid panel token required")
+            return
+        try:
+            state, image = current_state()
+        except Exception as exc:
+            self.send_error(503, f"panel unavailable: {exc}")
+            return
+        if relative_path == "/qr.png":
+            if image is None:
+                self.send_error(404, "login QR is not active")
+                return
+            body = image.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+        elif relative_path in {"/", "/index.html"}:
+            status = str(state["mode"])
+            config = management_config()
+            protocol_json = html.escape(json.dumps(config["protocol"], ensure_ascii=False, indent=2))
+            contacts_json = html.escape(json.dumps(config["contacts"], ensure_ascii=False, indent=2))
+            qr = f"<img src='{qr_image_path()}' alt='WeChat login QR'>" if image else "<p>已登录，二维码不再显示。</p>"
+            body = f"""<!doctype html><meta charset='utf-8'><title>WeChat Adapter Panel</title>
+<style>body{{font-family:system-ui;background:#f5f7f9;color:#17212b;margin:0}}main{{max-width:820px;margin:32px auto;background:#fff;padding:28px;border:1px solid #d0d7de}}img{{max-width:292px;width:100%;display:block;margin:18px auto}}code,pre{{background:#eef2f6;padding:8px;white-space:pre-wrap}}section{{border-top:1px solid #d8dee4;margin-top:22px;padding-top:18px}}input,textarea{{box-sizing:border-box;width:100%;padding:9px;margin:4px 0 12px}}button{{background:#07c160;color:#fff;border:0;padding:9px 14px;border-radius:5px}}small{{color:#57606a}}</style>
+<main><h1>WeChat Adapter</h1><p>微信状态：<code>{status}</code></p>{qr}
+<section><h2>联系人映射</h2><p><small>配置一次后，其他 OneBot 客户端使用对应 user_id 即可自动搜索并发送。</small></p><label>OneBot user_id</label><input id='user_id'><label>微信搜索键（昵称、备注或 wxid）</label><input id='search_key'><button onclick='saveContact()'>保存联系人映射</button><pre>{contacts_json}</pre></section>
+<section><h2>私聊入站</h2><p><small>实验性功能，当前暂停校准。启用后只处理已登记私聊文本；请勿置顶或折叠会话。群聊和 @ 提及暂不支持。</small></p></section>
+<section><h2>OneBot 协议</h2><p><small>反向 WS 与正向 WS；保存协议后重载网关生效。</small></p><textarea id='protocol' rows='12'>{protocol_json}</textarea><button onclick='saveProtocol()'>保存协议配置</button></section>
+<section><h2>运行日志</h2><p><small>只显示服务状态和错误；访问令牌、聊天正文和登录资料已过滤。</small></p><button onclick='loadLogs()'>刷新日志</button><pre id='logs'>加载中…</pre></section>
+<pre id='result'></pre></main>
+<script>const base=location.pathname.endsWith('/')?location.pathname:location.pathname+'/';async function post(path,data){{let r=await fetch(base+path,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(data)}});document.getElementById('result').textContent=await r.text();if(r.ok)setTimeout(()=>location.reload(),500)}}async function loadLogs(){{let r=await fetch(base+'api/v1/logs');let data=await r.json();document.getElementById('logs').textContent=(data.lines||[]).join('\\n')||'暂无运行日志';}}function saveContact(){{post('api/v1/contacts',{{user_id:user_id.value,search_key:search_key.value}})}}function saveProtocol(){{try{{post('api/v1/protocol',JSON.parse(protocol.value))}}catch(e){{result.textContent=e}}}}loadLogs();</script></main>""".encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+        elif relative_path == "/api/v1/logs":
+            body = json.dumps({"lines": runtime_logs()}, ensure_ascii=False).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+        elif relative_path == "/api/v1/state":
+            body = json.dumps({**state, **management_config(), "inbound": private_inbound_status()}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+        else:
+            self.send_error(404)
+            return
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        token = token_from_path(parsed.path) or parse_qs(parsed.query).get("token", [None])[0]
+        relative_path = "/" + "/".join([part for part in parsed.path.split("/") if part][1:])
+        if not authorized(token):
+            self.send_error(403, "valid panel token required")
+            return
+        try:
+            size = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(size))
+            if relative_path == "/api/v1/contacts":
+                apply_contact_mapping(Path("runtime/wechat-profile/adapter/contacts.json"), payload)
+                body = json.dumps({"ok": True, "restart_required": False}).encode()
+            elif relative_path == "/api/v1/protocol":
+                config = apply_protocol_config(GATEWAY_RUNTIME / "protocol.json", payload)
+                body = json.dumps({"ok": True, "protocol": config.__dict__, "restart_required": True}, default=lambda o: o.__dict__).encode()
+            else:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (ValueError, json.JSONDecodeError) as exc:
+            self.send_error(400, str(exc))
+
+
+
+def main() -> None:
+    if not TOKEN:
+        raise SystemExit("PANEL_TOKEN must be set")
+    ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+
+
+if __name__ == "__main__":
+    main()
